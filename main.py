@@ -1,3 +1,4 @@
+# main.py
 import sys
 import os
 import glob
@@ -6,42 +7,71 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QListWidgetItem, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QFormLayout, QSpinBox,
                              QColorDialog, QMessageBox, QSplitter)
-from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QIcon, QPainter, QFontMetrics
-from PyQt5.QtCore import Qt, QSize, QPoint
+from PyQt5.QtGui import QPixmap, QFont, QColor, QIcon, QPainter, QFontMetrics, QFontDatabase
+from PyQt5.QtCore import Qt, QSize, QPoint, QRect, pyqtSignal
 from PIL import Image, ImageDraw, ImageFont
-import math
+
+# ----------------------
+# 帮助寻找系统字体路径（常见位置）
+# ----------------------
+def find_system_font_path():
+    candidates = [
+        # Windows 常见
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\ARIAL.TTF",
+        r"C:\Windows\Fonts\msyh.ttf",
+        # Linux 常见
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        # macOS 常见
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/SFNSText.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 # ----------------------
 # 可拖拽且直接绘制水印的预览 QLabel
 # ----------------------
 class WatermarkPreviewLabel(QLabel):
+    # 拖拽后发出信号，主窗口会监听以自动切换到手动模式
+    customPosChanged = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.base_pixmap = None  # 原始 QPixmap（full-size）
-        self.display_pixmap = None  # 缩放后的显示 QPixmap（绘制使用）
+        self.base_pixmap = None  # 原始 QPixmap（完整像素）
+        self.display_pixmap = None  # 缩放到 widget 的 QPixmap（绘制用）
         self.img_width = 0
         self.img_height = 0
 
-        # watermark preview params
+        # 水印参数（字体大小表示“原始图片上的像素大小”）
         self.text = "Watermark"
-        self.font_size = 32
+        self.font_size = 32  # 原图像像素为单位
         self.color = QColor(0, 0, 0)
-        self.opacity = 50  # percent
+        self.opacity = 50
         self.position_text = "右下角"  # 预设位置名称或 "手动"
 
-        # custom position stored in original image pixel coordinates (x, y) - center anchor
-        self.custom_pos = None  # (x_pixels, y_pixels)
+        # 字体家族（若通过 QFontDatabase 注册了外部字体，会放这里）
+        self.font_family = None
 
-        # dragging state
+        # custom position（原图像像素坐标，中心点锚）
+        self.custom_pos = None
+
+        # 拖拽状态
         self.dragging = False
-        self.drag_offset = QPoint(0, 0)  # offset between mouse and center when start drag
+        self.drag_offset = QPoint(0, 0)
 
-        # cache last computed draw bbox (in display coords) to detect clicks on watermark
-        self.last_text_rect = None  # QRect in display coords
+        # 用于点击检测的上次文字矩形（display coords）
+        self.last_text_rect = None
+
+    def set_font_family(self, family_name):
+        self.font_family = family_name
 
     def set_image(self, pixmap: QPixmap):
-        """设置当前基准图片（原始大小）"""
         if pixmap is None or pixmap.isNull():
             self.base_pixmap = None
             self.display_pixmap = None
@@ -49,34 +79,13 @@ class WatermarkPreviewLabel(QLabel):
             self.img_height = 0
             self.update()
             return
-
         self.base_pixmap = pixmap
         self.img_width = pixmap.width()
         self.img_height = pixmap.height()
         self.update_display_pixmap()
         self.update()
 
-    def update_preview_params(self, text=None, font_size=None, color=None, opacity=None, position_text=None):
-        """更新水印参数（调用后会重绘）"""
-        if text is not None:
-            self.text = text if text.strip() else "Watermark"
-        if font_size is not None:
-            self.font_size = int(font_size)
-        if color is not None:
-            self.color = color
-        if opacity is not None:
-            self.opacity = int(opacity)
-        if position_text is not None:
-            self.position_text = position_text
-        # If position becomes preset (非手动) we don't erase custom_pos; custom_pos only used if position_text == "手动"
-        self.update_display_pixmap()
-        self.update()
-
-    def sizeHint(self):
-        return QSize(400, 300)
-
     def update_display_pixmap(self):
-        """生成适合当前 widget 大小的 display_pixmap（保持纵横比）"""
         if not self.base_pixmap:
             self.display_pixmap = None
             return
@@ -87,56 +96,64 @@ class WatermarkPreviewLabel(QLabel):
             return
         self.display_pixmap = self.base_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    def update_preview_params(self, text=None, font_size=None, color=None, opacity=None, position_text=None):
+        if text is not None:
+            self.text = text if text.strip() else "Watermark"
+        if font_size is not None:
+            self.font_size = int(font_size)
+        if color is not None:
+            self.color = color
+        if opacity is not None:
+            self.opacity = int(opacity)
+        if position_text is not None:
+            self.position_text = position_text
+        self.update_display_pixmap()
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
 
         if not self.display_pixmap:
-            # 显示提示文字
             painter.drawText(self.rect(), Qt.AlignCenter, "请选择一张图片")
+            painter.end()
             return
 
-        # 计算 display_pixmap 放置在 widget 中的位置（居中）
         dp = self.display_pixmap
         dw = dp.width()
         dh = dp.height()
         x = (self.width() - dw) // 2
         y = (self.height() - dh) // 2
 
-        # 画图片
         painter.drawPixmap(x, y, dp)
 
-        # 计算缩放系数（image_pixel -> display_pixel）
-        scale_x = dw / self.img_width if self.img_width else 1.0
-        scale_y = dh / self.img_height if self.img_height else 1.0
-        # 保持比例（一致）
-        scale = min(scale_x, scale_y) if (self.img_width and self.img_height) else 1.0
+        # scale: 原始 image pixels -> display pixels 的缩放比例 （统一用 x 方向）
+        scale = (dw / self.img_width) if (self.img_width and dw) else 1.0
 
-        # 准备字体
+        # 设定 QFont 的像素大小为 原始像素大小 * scale -> 这样预览字体和导出字体按比例一致
+        display_font_px = max(1, int(self.font_size * scale))
+
         qfont = QFont()
-        qfont.setPointSize(self.font_size)
+        if self.font_family:
+            qfont.setFamily(self.font_family)
+        qfont.setPixelSize(display_font_px)
         painter.setFont(qfont)
         fm = QFontMetrics(qfont)
         text = self.text
         text_w = fm.horizontalAdvance(text)
         text_h = fm.height()
 
-        # 计算文本在 display 坐标系中的位置（左上角）
         margin = 10
         pos_name = self.position_text
 
         if pos_name == "手动" and self.custom_pos is not None:
-            # custom_pos stored in original image pixels (center anchor)
             cx_img, cy_img = self.custom_pos
             disp_cx = int(cx_img * scale) + x
             disp_cy = int(cy_img * scale) + y
-            # 将中心点映射到左上角
             tx = disp_cx - text_w // 2
             ty = disp_cy - text_h // 2
         else:
-            # 预设九宫格位置
-            # 左上, 上中, 右上, 左中, 居中, 右中, 左下, 下中, 右下
             if pos_name == "左上角":
                 tx = x + margin
                 ty = y + margin
@@ -165,39 +182,30 @@ class WatermarkPreviewLabel(QLabel):
                 tx = x + dw - text_w - margin
                 ty = y + dh - text_h - margin
             else:
-                # fallback to bottom-right
                 tx = x + dw - text_w - margin
                 ty = y + dh - text_h - margin
 
-        # 记录文本矩形（display coords）以便点击检测
-        from PyQt5.QtCore import QRect
         self.last_text_rect = QRect(tx, ty, text_w, text_h)
 
-        # 设置颜色与透明度
         color = QColor(self.color)
         alpha = max(0, min(255, int(255 * (self.opacity / 100.0))))
         color.setAlpha(alpha)
         painter.setPen(color)
 
-        # 直接绘制文本（未使用阴影）
-        painter.drawText(tx, ty + fm.ascent(), text)  # y + ascent 以保证基线对齐
-
+        # drawText 的 y 参数为 baseline，所以用 ascent 来定位垂直位置
+        painter.drawText(tx, ty + fm.ascent(), text)
         painter.end()
 
-    # ---------- 鼠标事件：实现拖拽（以文本中心为锚点） ----------
     def mousePressEvent(self, event):
         if not self.display_pixmap:
             return super().mousePressEvent(event)
 
         if event.button() == Qt.LeftButton:
             pt = event.pos()
-            # 点击落在水印文本矩形内则允许拖拽
             if self.last_text_rect and self.last_text_rect.contains(pt):
                 self.dragging = True
-                # 记录拖拽偏移（mouse 与文本中心）
                 center = self.last_text_rect.center()
                 self.drag_offset = pt - center
-                # 启动拖拽（为了立即开始移动）
                 event.accept()
             else:
                 super().mousePressEvent(event)
@@ -207,30 +215,25 @@ class WatermarkPreviewLabel(QLabel):
     def mouseMoveEvent(self, event):
         if self.dragging and self.display_pixmap:
             pt = event.pos()
-            # 计算文本中心新的 display 坐标（mouse - offset）
             center_disp_x = pt.x() - self.drag_offset.x()
             center_disp_y = pt.y() - self.drag_offset.y()
 
-            # 计算 display image origin (x,y) 与 scale （与 paintEvent 保持一致）
             dp = self.display_pixmap
             dw = dp.width()
             dh = dp.height()
             img_x = (self.width() - dw) // 2
             img_y = (self.height() - dh) // 2
-            scale = dw / self.img_width if self.img_width else 1.0
+            scale = (dw / self.img_width) if (self.img_width and dw) else 1.0
 
-            # 将 display 中的中心点映射回原始图像像素坐标
             cx_img = (center_disp_x - img_x) / scale
             cy_img = (center_disp_y - img_y) / scale
 
-            # 限制到图片内
             cx_img = max(0, min(self.img_width, cx_img))
             cy_img = max(0, min(self.img_height, cy_img))
 
             self.custom_pos = (cx_img, cy_img)
-
-            # 一旦用户拖拽，则视作“手动”模式（外部逻辑会把下拉框切换为“手动”）
-            # 只是本控件内部不负责更改下拉框，主窗口会监听 custom_pos 变化（通过回调）
+            # 拖拽过程中也发信号（主窗口会切换到手动）
+            self.customPosChanged.emit()
             self.update()
             event.accept()
         else:
@@ -239,6 +242,8 @@ class WatermarkPreviewLabel(QLabel):
     def mouseReleaseEvent(self, event):
         if self.dragging:
             self.dragging = False
+            # 确保释放后也通知一次（以便主窗口立即切换为手动）
+            self.customPosChanged.emit()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -248,7 +253,6 @@ class WatermarkPreviewLabel(QLabel):
         self.update()
 
     def get_custom_pos_image_coords(self):
-        """返回 custom_pos（原图像像素坐标）或 None"""
         return self.custom_pos
 
 # ----------------------
@@ -257,12 +261,11 @@ class WatermarkPreviewLabel(QLabel):
 class PhotoWatermarkApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.font_path = find_system_font_path()  # 尝试找一个系统字体以在 Pillow 中使用
+        self.font_family = None  # 若成功在 Qt 中注册会填上
         self.initUI()
 
-        # 存储导入的图片路径
         self.image_paths = []
-
-        # 允许拖拽外部 file 到窗口
         self.setAcceptDrops(True)
 
     def initUI(self):
@@ -272,26 +275,21 @@ class PhotoWatermarkApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-
         splitter = QSplitter(Qt.Horizontal)
 
-        # 左侧：图片列表与导入按钮
+        # 左侧
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         import_layout = QHBoxLayout()
-
         self.import_single_btn = QPushButton("导入单张图片")
         self.import_single_btn.clicked.connect(self.import_single_image)
         import_layout.addWidget(self.import_single_btn)
-
         self.import_multi_btn = QPushButton("导入多张图片")
         self.import_multi_btn.clicked.connect(self.import_multiple_images)
         import_layout.addWidget(self.import_multi_btn)
-
         self.import_folder_btn = QPushButton("导入文件夹")
         self.import_folder_btn.clicked.connect(self.import_folder)
         import_layout.addWidget(self.import_folder_btn)
-
         left_layout.addLayout(import_layout)
 
         self.image_list = QListWidget()
@@ -304,35 +302,43 @@ class PhotoWatermarkApp(QMainWindow):
         self.remove_btn = QPushButton("移除选中图片")
         self.remove_btn.clicked.connect(self.remove_selected)
         left_layout.addWidget(self.remove_btn)
-
         splitter.addWidget(left_panel)
 
-        # 右侧：预览 + 设置
+        # 右侧
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
         preview_group = QGroupBox("预览")
         preview_layout = QVBoxLayout(preview_group)
-
-        # 使用自定义的 WatermarkPreviewLabel
         self.preview_label = WatermarkPreviewLabel()
         self.preview_label.setMinimumHeight(360)
         self.preview_label.setStyleSheet("border: 1px solid #ccc; background: #fff;")
         preview_layout.addWidget(self.preview_label)
         right_layout.addWidget(preview_group)
 
+        # 如果找到了字体路径，尝试在 Qt 中注册以保证预览与 Pillow 字体家族一致
+        if self.font_path:
+            try:
+                font_id = QFontDatabase.addApplicationFont(self.font_path)
+                if font_id != -1:
+                    families = QFontDatabase.applicationFontFamilies(font_id)
+                    if families:
+                        self.font_family = families[0]
+                        self.preview_label.set_font_family(self.font_family)
+            except Exception:
+                self.font_family = None
+
         watermark_group = QGroupBox("水印设置")
         watermark_layout = QFormLayout(watermark_group)
-
         self.watermark_text = QLineEdit("Watermark")
         self.watermark_text.textChanged.connect(self.on_setting_changed)
         watermark_layout.addRow("水印文本:", self.watermark_text)
 
         self.font_size = QSpinBox()
-        self.font_size.setRange(8, 200)
+        self.font_size.setRange(8, 400)
         self.font_size.setValue(32)
         self.font_size.valueChanged.connect(self.on_setting_changed)
-        watermark_layout.addRow("字体大小:", self.font_size)
+        watermark_layout.addRow("字体大小 (像素):", self.font_size)
 
         self.opacity = QSpinBox()
         self.opacity.setRange(0, 100)
@@ -349,7 +355,6 @@ class PhotoWatermarkApp(QMainWindow):
         watermark_layout.addRow("水印颜色:", color_layout)
 
         self.position = QComboBox()
-        # 添加九宫格 + 手动
         self.position.addItems(["左上角", "上中", "右上角", "左中", "居中", "右中", "左下角", "下中", "右下角", "手动"])
         self.position.currentIndexChanged.connect(self.on_position_changed)
         watermark_layout.addRow("水印位置:", self.position)
@@ -358,7 +363,6 @@ class PhotoWatermarkApp(QMainWindow):
 
         output_group = QGroupBox("输出设置")
         output_layout = QFormLayout(output_group)
-
         output_folder_layout = QHBoxLayout()
         self.output_folder = QLineEdit()
         self.browse_btn = QPushButton("浏览...")
@@ -378,7 +382,6 @@ class PhotoWatermarkApp(QMainWindow):
 
         self.name_modifier = QLineEdit("wm_")
         output_layout.addRow("前缀/后缀:", self.name_modifier)
-
         right_layout.addWidget(output_group)
 
         self.apply_btn = QPushButton("应用水印并导出")
@@ -390,19 +393,13 @@ class PhotoWatermarkApp(QMainWindow):
         splitter.setSizes([320, 680])
         main_layout.addWidget(splitter)
 
-        # 信号连接：点击图片切换预览
+        # 信号连接
         self.image_list.itemSelectionChanged.connect(self.update_preview_from_selection)
-
-        # 当预览控件内部 custom_pos 改变（拖拽后），需要主窗口把下拉框切换为“手动”
-        # 这里通过定时检查 custom_pos 的方式检测拖拽后状态（简单且可靠）
-        # 也可以在 WatermarkPreviewLabel 中暴露信号，这里为简洁使用定期更新
-        # 我们使用 widget 的 mouse release 时更新一次：覆盖 preview_label.mouseReleaseEvent 并回调（更直接）
-        # 为简单我们在鼠标释放后主动调用 update_preview_from_selection()
-        # （实际拖拽过程中 preview 已实时更新）
+        self.preview_label.customPosChanged.connect(self.on_preview_custom_pos_changed)
 
         self.show()
 
-    # ----------------- 文件 / 列表管理 -----------------
+    # ---------- drag & drop / list ----------
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -472,9 +469,8 @@ class PhotoWatermarkApp(QMainWindow):
             self.preview_label.set_image(None)
             self.preview_label.update_preview_params(text="请选择一张图片")
 
-    # ----------------- 预览与设置变更 -----------------
+    # ---------- 预览与设置变更 ----------
     def update_preview_from_selection(self):
-        """当列表选择变化或设置变化时调用，更新 preview_label 的 image 与参数"""
         selected_items = self.image_list.selectedItems()
         if selected_items:
             index = self.image_list.row(selected_items[0])
@@ -486,7 +482,6 @@ class PhotoWatermarkApp(QMainWindow):
         else:
             self.preview_label.set_image(None)
 
-        # 更新 preview 的参数（会触发绘制）
         self.preview_label.update_preview_params(
             text=self.watermark_text.text(),
             font_size=self.font_size.value(),
@@ -495,20 +490,25 @@ class PhotoWatermarkApp(QMainWindow):
             position_text=self.position.currentText()
         )
 
-        # 如果用户完成拖拽（preview_label.custom_pos 被设置），我们需要把 position 下拉切换为 "手动"
-        if self.preview_label.get_custom_pos_image_coords() is not None and self.position.currentText() != "手动":
-            # 切换为手动模式
-            idx = self.position.findText("手动")
-            if idx >= 0:
-                self.position.setCurrentIndex(idx)
-
     def on_setting_changed(self, *_):
-        # 设置变更后实时更新预览；若用户之前拖拽过并处于手动模式，则保留 custom_pos
         self.update_preview_from_selection()
 
     def on_position_changed(self, index):
-        # 当用户从下拉框选择预设/手动时，若切换到非手动则不清除 custom_pos（用户可能想恢复手动）
-        # 但预览应根据 position_text 反映
+        self.preview_label.update_preview_params(
+            text=self.watermark_text.text(),
+            font_size=self.font_size.value(),
+            color=self.watermark_color,
+            opacity=self.opacity.value(),
+            position_text=self.position.currentText()
+        )
+
+    def on_preview_custom_pos_changed(self):
+        # 预览控件发来拖拽事件 -> 自动切换为手动
+        if self.position.currentText() != "手动":
+            idx = self.position.findText("手动")
+            if idx >= 0:
+                self.position.setCurrentIndex(idx)
+        # 更新 preview（已由 preview 自身更新过，但保持同步）
         self.preview_label.update_preview_params(
             text=self.watermark_text.text(),
             font_size=self.font_size.value(),
@@ -521,7 +521,6 @@ class PhotoWatermarkApp(QMainWindow):
         color = QColorDialog.getColor(self.watermark_color, self, "选择水印颜色")
         if color.isValid():
             self.watermark_color = color
-            # 更新按钮样式
             if color.lightness() < 128:
                 self.color_btn.setStyleSheet(f"background-color: {color.name()}; color: white;")
             else:
@@ -543,7 +542,7 @@ class PhotoWatermarkApp(QMainWindow):
             else:
                 self.name_modifier.setText("_wm")
 
-    # ----------------- 导出（Pillow） -----------------
+    # ---------- 导出（Pillow） ----------
     def apply_watermark(self):
         if not self.image_paths:
             QMessageBox.warning(self, "警告", "请先导入图片")
@@ -554,7 +553,6 @@ class PhotoWatermarkApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请选择输出文件夹")
             return
 
-        # 检查是否尝试导出到原文件夹（阻止覆盖）
         for image_path in self.image_paths:
             image_folder = os.path.dirname(image_path)
             if os.path.abspath(output_folder) == os.path.abspath(image_folder):
@@ -567,29 +565,24 @@ class PhotoWatermarkApp(QMainWindow):
         error_count = 0
         for image_path in self.image_paths:
             try:
-                # 如果有选中并处于手动 mode，使用 preview_label 中的 custom_pos（必须和当前图片对应）
+                # 如果当前选中项并处在手动模式 -> 使用 preview 的 custom_pos（原图像像素）
                 custom_coords = None
                 selected_items = self.image_list.selectedItems()
                 if selected_items:
                     sel_index = self.image_list.row(selected_items[0])
-                    # Only use preview custom pos if the selected item corresponds to this image_path
                     if 0 <= sel_index < len(self.image_paths) and self.image_paths[sel_index] == image_path:
                         if self.position.currentText() == "手动":
                             custom_coords = self.preview_label.get_custom_pos_image_coords()
-                # 调用添加水印方法（支持 custom_coords）
                 self.add_watermark_to_image(image_path, output_folder, custom_coords)
                 success_count += 1
             except Exception as e:
-                print(f"处理图片 {image_path} 时出错: {str(e)}")
+                print(f"处理图片 {image_path} 时出错: {e}")
                 error_count += 1
 
         QMessageBox.information(self, "完成", f"处理完成！\n成功: {success_count} 张\n失败: {error_count} 张")
 
     def add_watermark_to_image(self, image_path, output_folder, custom_coords=None):
-        """给单张图片添加水印并保存。custom_coords: (x_pixels, y_pixels) in original image coords used when position=='手动'"""
-        # 打开图片
         with Image.open(image_path) as img:
-            # 确保图片有Alpha通道（透明）
             orig_mode = img.mode
             if img.mode not in ('RGBA', 'LA'):
                 if img.mode == 'P':
@@ -597,41 +590,42 @@ class PhotoWatermarkApp(QMainWindow):
                 else:
                     img = img.convert('RGBA')
 
-            watermark_layer = Image.new('RGBA', img.size, (255, 255, 255, 0))
-            draw = ImageDraw.Draw(watermark_layer)
+            draw_layer = Image.new('RGBA', img.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(draw_layer)
 
-            # 文本与字体
             text = self.watermark_text.text() or "Watermark"
-            font_size = self.font_size.value()
+            font_size = self.font_size.value()  # 这是“原图像上的像素大小”
 
-            # 尝试加载系统字体（可根据需要调整路径）
-            try:
-                font = ImageFont.truetype("arial.ttf", font_size)
-            except Exception:
+            # 优先使用找到的系统字体路径
+            pil_font = None
+            if self.font_path:
                 try:
-                    # 尝试常见路径（Linux/Mac 可能没有 arial）
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                    pil_font = ImageFont.truetype(self.font_path, font_size)
                 except Exception:
-                    font = ImageFont.load_default()
+                    pil_font = None
+            if pil_font is None:
+                try:
+                    pil_font = ImageFont.truetype("arial.ttf", font_size)
+                except Exception:
+                    pil_font = ImageFont.load_default()
 
-            # 获取文本大小（兼容 Pillow 旧/新 API）
+            # 文本尺寸（兼容旧/新 pillow）
             try:
-                text_width, text_height = draw.textsize(text, font=font)
+                text_width, text_height = draw.textsize(text, font=pil_font)
             except AttributeError:
-                bbox = draw.textbbox((0, 0), text, font=font)
+                bbox = draw.textbbox((0, 0), text, font=pil_font)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
 
             width, height = img.size
             position = self.position.currentText()
+            margin = 10
 
-            # 计算文本位置（左上角坐标）在原图像像素坐标系
             if position == "手动" and custom_coords is not None:
                 cx_img, cy_img = custom_coords
                 x = int(cx_img - text_width / 2)
                 y = int(cy_img - text_height / 2)
             else:
-                margin = 10
                 if position == "左上角":
                     x, y = margin, margin
                 elif position == "上中":
@@ -662,18 +656,13 @@ class PhotoWatermarkApp(QMainWindow):
                     x = width - text_width - margin
                     y = height - text_height - margin
 
-            # 颜色与透明度
             r, g, b, _ = self.watermark_color.getRgb()
             opacity = self.opacity.value()
             alpha = int(255 * opacity / 100)
 
-            # 绘制文本到 watermark_layer
-            draw.text((x, y), text, font=font, fill=(r, g, b, alpha))
+            draw.text((x, y), text, font=pil_font, fill=(r, g, b, alpha))
 
-            # 合成
-            watermarked = Image.alpha_composite(img, watermark_layer)
-
-            # 输出格式与文件名处理
+            watermarked = Image.alpha_composite(img, draw_layer)
             output_format = self.output_format.currentText().lower()
             file_name = os.path.basename(image_path)
             base_name, ext = os.path.splitext(file_name)
@@ -689,8 +678,7 @@ class PhotoWatermarkApp(QMainWindow):
             output_file_name = f"{new_base_name}.{output_format}"
             output_path = os.path.join(output_folder, output_file_name)
 
-            if output_format == 'jpeg' or output_format == 'jpg':
-                # JPEG 不支持 alpha
+            if output_format in ('jpeg', 'jpg'):
                 watermarked = watermarked.convert('RGB')
 
             watermarked.save(output_path)
