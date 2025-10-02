@@ -52,5 +52,5 @@
 如需自己打包应用，可以使用以下命令:
 
 ```bash
-python setup.py build
+pyinstaller main.py --name "PhotoWatermark2" --noconsole --onefile --add-data "templates;templates" --hidden-import "PIL" --hidden-import "PyQt5"
 ```
