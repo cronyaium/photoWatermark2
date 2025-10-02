@@ -16,7 +16,21 @@ from PIL import Image, ImageDraw, ImageFont
 # ----------------------
 # 配置：模板目录与 last used 文件名
 # ----------------------
-TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+import sys
+
+def get_templates_dir():
+    # 如果是打包后的 exe，sys._MEIPASS 或 sys.argv[0] 会指向 exe 所在目录
+    if getattr(sys, 'frozen', False):
+        # exe 文件所在目录
+        exe_dir = os.path.dirname(sys.executable)
+        return os.path.join(exe_dir, "templates")
+    else:
+        # 普通脚本模式
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+TEMPLATES_DIR = get_templates_dir()
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
 LAST_USED_FILENAME = "last_used.json"
 
 # ----------------------
