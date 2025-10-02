@@ -2,14 +2,22 @@
 import sys
 import os
 import glob
+import json
+import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QFileDialog, QListWidget,
                              QListWidgetItem, QLabel, QComboBox, QLineEdit,
                              QGroupBox, QFormLayout, QSpinBox,
-                             QColorDialog, QMessageBox, QSplitter)
+                             QColorDialog, QMessageBox, QSplitter, QInputDialog)
 from PyQt5.QtGui import QPixmap, QFont, QColor, QIcon, QPainter, QFontMetrics, QFontDatabase
 from PyQt5.QtCore import Qt, QSize, QPoint, QRect, pyqtSignal
 from PIL import Image, ImageDraw, ImageFont
+
+# ----------------------
+# 配置：模板目录与 last used 文件名
+# ----------------------
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+LAST_USED_FILENAME = "last_used.json"
 
 # ----------------------
 # 帮助寻找系统字体路径（常见位置）
@@ -192,7 +200,6 @@ class WatermarkPreviewLabel(QLabel):
         color.setAlpha(alpha)
         painter.setPen(color)
 
-        # drawText 的 y 参数为 baseline，所以用 ascent 来定位垂直位置
         painter.drawText(tx, ty + fm.ascent(), text)
         painter.end()
 
@@ -263,10 +270,17 @@ class PhotoWatermarkApp(QMainWindow):
         super().__init__()
         self.font_path = find_system_font_path()  # 尝试找一个系统字体以在 Pillow 中使用
         self.font_family = None  # 若成功在 Qt 中注册会填上
+        # 确保模板目录存在
+        os.makedirs(TEMPLATES_DIR, exist_ok=True)
         self.initUI()
 
         self.image_paths = []
         self.setAcceptDrops(True)
+
+        # 程序启动时尝试加载 last used 设置
+        self.load_last_used_template_if_exists()
+        # 刷新模板下拉
+        self.refresh_template_list()
 
     def initUI(self):
         self.setWindowTitle('Photo Watermark 2')
@@ -358,6 +372,20 @@ class PhotoWatermarkApp(QMainWindow):
         self.position.addItems(["左上角", "上中", "右上角", "左中", "居中", "右中", "左下角", "下中", "右下角", "手动"])
         self.position.currentIndexChanged.connect(self.on_position_changed)
         watermark_layout.addRow("水印位置:", self.position)
+
+        # 模板管理行（放在水印设置中，尽量不改变原有位置结构）
+        tpl_hbox = QHBoxLayout()
+        self.template_combo = QComboBox()
+        self.template_combo.setEditable(False)
+        self.template_combo.currentIndexChanged.connect(self.on_template_selected)
+        tpl_hbox.addWidget(self.template_combo)
+        self.save_template_btn = QPushButton("保存为模板")
+        self.save_template_btn.clicked.connect(self.save_current_as_template)
+        tpl_hbox.addWidget(self.save_template_btn)
+        self.delete_template_btn = QPushButton("删除模板")
+        self.delete_template_btn.clicked.connect(self.delete_selected_template)
+        tpl_hbox.addWidget(self.delete_template_btn)
+        watermark_layout.addRow("模板管理:", tpl_hbox)
 
         right_layout.addWidget(watermark_group)
 
@@ -490,8 +518,13 @@ class PhotoWatermarkApp(QMainWindow):
             position_text=self.position.currentText()
         )
 
+        # 在切换图片或更新预览时，保存 last used 设置
+        self.save_last_used_template()
+
     def on_setting_changed(self, *_):
         self.update_preview_from_selection()
+        # 实时保存当前设置为 last_used
+        self.save_last_used_template()
 
     def on_position_changed(self, index):
         self.preview_label.update_preview_params(
@@ -501,6 +534,8 @@ class PhotoWatermarkApp(QMainWindow):
             opacity=self.opacity.value(),
             position_text=self.position.currentText()
         )
+        # 保存 last used
+        self.save_last_used_template()
 
     def on_preview_custom_pos_changed(self):
         # 预览控件发来拖拽事件 -> 自动切换为手动
@@ -516,6 +551,8 @@ class PhotoWatermarkApp(QMainWindow):
             opacity=self.opacity.value(),
             position_text=self.position.currentText()
         )
+        # 拖拽后保存 last used（以保留 custom_pos）
+        self.save_last_used_template()
 
     def choose_color(self):
         color = QColorDialog.getColor(self.watermark_color, self, "选择水印颜色")
@@ -531,6 +568,8 @@ class PhotoWatermarkApp(QMainWindow):
         folder_path = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
         if folder_path:
             self.output_folder.setText(folder_path)
+            # 保存 last used folder
+            self.save_last_used_template()
 
     def update_naming_options(self, index):
         if index == 0:
@@ -541,6 +580,188 @@ class PhotoWatermarkApp(QMainWindow):
                 self.name_modifier.setText("wm_")
             else:
                 self.name_modifier.setText("_wm")
+
+    # ---------- 模板管理 ----------
+    def template_file_path(self, name):
+        safe_name = f"{name}.json"
+        return os.path.join(TEMPLATES_DIR, safe_name)
+
+    def refresh_template_list(self):
+        """扫描 templates/ 并刷新下拉框（第一个项为 -- 无 -- ）"""
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        files = []
+        try:
+            for f in os.listdir(TEMPLATES_DIR):
+                if f.endswith(".json"):
+                    files.append(f)
+            files = sorted(files)
+            # 放一个空项或 "选择模板"
+            self.template_combo.addItem("-- 选择模板 --")
+            for f in files:
+                if f == LAST_USED_FILENAME:
+                    continue
+                name = f[:-5]
+                self.template_combo.addItem(name)
+        except Exception:
+            # ignore
+            pass
+        self.template_combo.blockSignals(False)
+
+    def save_current_as_template(self):
+        name, ok = QInputDialog.getText(self, "保存模板", "模板名称：")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            # 为空则使用时间戳
+            name = f"tpl_{int(time.time())}"
+        # 准备对象
+        tpl = self._collect_current_settings(include_custom_pos=True)
+        # 写入文件（覆盖同名）
+        try:
+            with open(self.template_file_path(name), "w", encoding="utf-8") as f:
+                json.dump(tpl, f, ensure_ascii=False, indent=2)
+            # 刷新下拉并选中该模板
+            self.refresh_template_list()
+            idx = self.template_combo.findText(name)
+            if idx >= 0:
+                self.template_combo.setCurrentIndex(idx)
+            QMessageBox.information(self, "保存成功", f"模板 '{name}' 已保存到 templates/ 目录（同名会覆盖）")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"保存模板时出错: {e}")
+
+    def delete_selected_template(self):
+        name = self.template_combo.currentText()
+        if not name or name == "-- 选择模板 --":
+            QMessageBox.information(self, "提示", "请选择要删除的模板")
+            return
+        path = self.template_file_path(name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                QMessageBox.information(self, "删除成功", f"模板 '{name}' 已删除")
+            except Exception as e:
+                QMessageBox.warning(self, "删除失败", f"删除模板时出错: {e}")
+        else:
+            QMessageBox.information(self, "提示", "模板文件不存在")
+        self.refresh_template_list()
+
+    def on_template_selected(self, index):
+        name = self.template_combo.currentText()
+        if not name or name == "-- 选择模板 --":
+            return
+        self.load_template_by_name(name)
+
+    def load_template_by_name(self, name):
+        path = self.template_file_path(name)
+        if not os.path.exists(path):
+            QMessageBox.information(self, "提示", "模板文件不存在")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tpl = json.load(f)
+            # 应用模板到 UI（不改变输出 folder 等）
+            self._apply_template_to_ui(tpl)
+            # 保存为 last used
+            self.save_last_used_template()
+            QMessageBox.information(self, "加载成功", f"模板 '{name}' 已应用")
+        except Exception as e:
+            QMessageBox.warning(self, "加载失败", f"加载模板时出错: {e}")
+
+    def _collect_current_settings(self, include_custom_pos=False):
+        """收集当前 UI 的水印设置为 dict，便于序列化"""
+        tpl = {
+            "text": self.watermark_text.text(),
+            "font_size": self.font_size.value(),
+            "opacity": self.opacity.value(),
+            "color": list(self.watermark_color.getRgb()[:3]),  # RGB
+            "position": self.position.currentText(),
+            "output_format": self.output_format.currentText(),
+            "naming_rule": self.naming_rule.currentIndex(),
+            "name_modifier": self.name_modifier.text(),
+            "output_folder": self.output_folder.text()
+        }
+        if include_custom_pos:
+            cp = self.preview_label.get_custom_pos_image_coords()
+            if cp is not None:
+                tpl["custom_pos"] = [float(cp[0]), float(cp[1])]
+            else:
+                tpl["custom_pos"] = None
+        return tpl
+
+    def _apply_template_to_ui(self, tpl):
+        """将模板内容应用回 UI（尽量不修改文件列表）"""
+        try:
+            self.watermark_text.setText(tpl.get("text", ""))
+            self.font_size.setValue(int(tpl.get("font_size", 32)))
+            self.opacity.setValue(int(tpl.get("opacity", 50)))
+            col = tpl.get("color", [0, 0, 0])
+            if isinstance(col, (list, tuple)) and len(col) >= 3:
+                self.watermark_color = QColor(col[0], col[1], col[2])
+                # update color button style
+                if self.watermark_color.lightness() < 128:
+                    self.color_btn.setStyleSheet(f"background-color: {self.watermark_color.name()}; color: white;")
+                else:
+                    self.color_btn.setStyleSheet(f"background-color: {self.watermark_color.name()}; color: black;")
+            pos = tpl.get("position", "右下角")
+            idx = self.position.findText(pos)
+            if idx >= 0:
+                self.position.setCurrentIndex(idx)
+            # output format / naming rule / output folder
+            of = tpl.get("output_format", None)
+            if of:
+                idx2 = self.output_format.findText(of)
+                if idx2 >= 0:
+                    self.output_format.setCurrentIndex(idx2)
+            nr = tpl.get("naming_rule", None)
+            if isinstance(nr, int):
+                if 0 <= nr < self.naming_rule.count():
+                    self.naming_rule.setCurrentIndex(nr)
+            nm = tpl.get("name_modifier", None)
+            if nm is not None:
+                self.name_modifier.setText(nm)
+            ofolder = tpl.get("output_folder", None)
+            if ofolder:
+                self.output_folder.setText(ofolder)
+            # custom pos
+            cp = tpl.get("custom_pos", None)
+            if cp is not None and isinstance(cp, (list, tuple)) and len(cp) >= 2:
+                # set preview_label custom_pos and switch to 手动
+                self.preview_label.custom_pos = (float(cp[0]), float(cp[1]))
+                idxm = self.position.findText("手动")
+                if idxm >= 0:
+                    self.position.setCurrentIndex(idxm)
+            else:
+                # 如果模板没有 custom pos，则不改变 preview_label.custom_pos（保持现状）
+                pass
+
+            # 更新 preview
+            self.update_preview_from_selection()
+        except Exception:
+            # 忽略单项失败，尽量应用其他项
+            self.update_preview_from_selection()
+
+    # ---------- last used 存取 ----------
+    def save_last_used_template(self):
+        tpl = self._collect_current_settings(include_custom_pos=True)
+        last_used_path = os.path.join(TEMPLATES_DIR, LAST_USED_FILENAME)
+        try:
+            with open(last_used_path, "w", encoding="utf-8") as f:
+                json.dump(tpl, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # 不阻塞主流程
+
+    def load_last_used_template_if_exists(self):
+        last_used_path = os.path.join(TEMPLATES_DIR, LAST_USED_FILENAME)
+        if os.path.exists(last_used_path):
+            try:
+                with open(last_used_path, "r", encoding="utf-8") as f:
+                    tpl = json.load(f)
+                # apply to UI but don't overwrite file list etc.
+                self._apply_template_to_ui(tpl)
+            except Exception:
+                pass
 
     # ---------- 导出（Pillow） ----------
     def apply_watermark(self):
@@ -553,6 +774,7 @@ class PhotoWatermarkApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请选择输出文件夹")
             return
 
+        # 检查是否尝试导出到原文件夹（阻止覆盖）
         for image_path in self.image_paths:
             image_folder = os.path.dirname(image_path)
             if os.path.abspath(output_folder) == os.path.abspath(image_folder):
@@ -565,7 +787,7 @@ class PhotoWatermarkApp(QMainWindow):
         error_count = 0
         for image_path in self.image_paths:
             try:
-                # 如果当前选中项并处在手动模式 -> 使用 preview 的 custom_pos（原图像像素）
+                # 如果当前选中项并处在手动 mode -> 使用 preview 的 custom_pos（原图像像素）
                 custom_coords = None
                 selected_items = self.image_list.selectedItems()
                 if selected_items:
